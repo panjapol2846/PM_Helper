@@ -97,6 +97,18 @@ def _find_table_by_title_then_next_table(soup: BeautifulSoup, title_patterns: Li
     df = _table_to_df(nxt)
     return _clean_cols(df) if df is not None and not df.empty else None
 
+def get_db_time_from_html(soup: BeautifulSoup) -> float:
+    """Extracts DB Time in minutes from the AWR report header."""
+    header_text = soup.get_text()
+    _DB_TIME_INLINE = re.compile(r"DB\s*Time[:\s]*([\d,\.]+)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?", re.I)
+    m = _DB_TIME_INLINE.search(header_text)
+    if m:
+        val = float(str(m.group(1)).replace(",", ""))
+        unit = (m.group(2) or "").lower()
+        if unit.startswith("h"): return val * 60.0
+        if unit.startswith("s"): return val / 60.0
+        return val
+    return 0.0
 
 # ---------- section parsers ----------
 
@@ -340,18 +352,23 @@ def analyze_instance_efficiency(data: Dict[str, Optional[float]]) -> str:
     else:
         return "✅ Hit Ratio: All statistics more than 70% or follow the same trend"
 
-def analyze_top10_foreground_events(data: List[Dict[str, Any]]) -> str:
-    warnings = []
+def analyze_top10_foreground_events(data: List[Dict[str, Any]], db_time_minutes: float) -> str:
+    # If DB Time is less than 50 minutes, the report is considered "Normal" for this check
+    if db_time_minutes < 50:
+        return "✅ Wait event: No concerning wait event with significant DB time more than CPU timeng running SQL with significant running time or wait"
+
+    # Find DB CPU %
     db_cpu_time = 0
     for row in data:
         if row.get("event") == "DB CPU":
             db_cpu_time = row.get("pct_db_time", 0)
             break
     
+    warnings = []
     for row in data:
         event = row.get("event")
         pct_db_time = row.get("pct_db_time")
-        if event != "DB CPU" and pct_db_time is not None and pct_db_time > db_cpu_time and pct_db_time > 20:
+        if event != "DB CPU" and pct_db_time is not None and pct_db_time > db_cpu_time:
             warnings.append(f"{event}: {pct_db_time:.1f}% DB Time")
     
     if warnings:
@@ -394,35 +411,82 @@ def analyze_sql_ordered_by_elapsed(data: List[Dict[str, Any]]) -> str:
 
 
 def analyze_sga_advisory(data: List[Dict[str, Any]]) -> str:
+    """
+    Analyzes SGA Target Advisory data to recommend size changes.
+
+    A recommendation is triggered if either of these conditions are met for a future size:
+    1. Original Logic: The relative improvement in physical reads is significant compared to the SGA size increase.
+    2. New Logic: A small SGA increase (<1GB) results in a very large drop (>10M) in physical reads.
+    """
     current_row = None
     target_row = None
+
+    # First, find the current configuration row (Size Factor = 1.0)
     for row in data:
         if _num(row.get('SGA Size Factor')) == 1.00:
             current_row = row
-        size_factor = _num(row.get('SGA Size Factor'))
-        if size_factor is not None and size_factor > 1.00:
-            est_physical_reads = _num(row.get('Est Physical Reads'))
-            if current_row and est_physical_reads is not None:
-                current_physical_reads = _num(current_row.get('Est Physical Reads'))
-                physical_reads_improvement = (current_physical_reads - est_physical_reads) / current_physical_reads
-                required_improvement = 1.5 * (size_factor - 1.0)
-                if physical_reads_improvement >= required_improvement:
-                    target_row = row
-                    break
+            break
     
     if not current_row:
         return "✅ SGA Advisor: Appropriate DB time and physical read"
+
+    # Now, iterate through potential target rows (size factor > 1.0) to find the first suitable recommendation
+    for row in data:
+        size_factor = _num(row.get('SGA Size Factor'))
+        
+        # We only care about rows representing an increase in size
+        if size_factor is None or size_factor <= 1.00:
+            continue
+
+        # Extract numeric values needed for both conditions
+        current_physical_reads = _num(current_row.get('Est Physical Reads'))
+        est_physical_reads = _num(row.get('Est Physical Reads'))
+        current_sga_size = _num(current_row.get('SGA Target Size (M)'))
+        target_sga_size = _num(row.get('SGA Target Size (M)'))
+
+        # If data is missing for a row, skip it
+        if any(v is None for v in [current_physical_reads, est_physical_reads, current_sga_size, target_sga_size]):
+            continue
+
+        # --- Condition 1: Original proportional improvement logic ---
+        condition1_met = False
+        # Avoid division by zero if there are no physical reads currently
+        if current_physical_reads > 0:
+            physical_reads_improvement_pct = (current_physical_reads - est_physical_reads) / current_physical_reads
+            required_improvement_pct = 1.5 * (size_factor - 1.0)
+            if physical_reads_improvement_pct >= required_improvement_pct:
+                condition1_met = True
+        
+        # --- Condition 2: New logic for large gains from small increases ---
+        sga_increase_mb = target_sga_size - current_sga_size
+        reads_decrease = current_physical_reads - est_physical_reads
+        
+        condition2_met = (sga_increase_mb < 1024 and reads_decrease > 10_000_000)
+
+        # If either condition is met, we've found our recommendation.
+        # We break to select the smallest SGA increase that satisfies the criteria.
+        if condition1_met or condition2_met:
+            target_row = row
+            break
     
+    # If a target row was identified, format the recommendation string
     if target_row:
+        # Re-read values to ensure they are the correct ones from the final target_row
         current_sga_size = _num(current_row.get('SGA Target Size (M)'))
         target_sga_size = _num(target_row.get('SGA Target Size (M)'))
         old_reads = _num(current_row.get('Est Physical Reads'))
         new_reads = _num(target_row.get('Est Physical Reads'))
+        
+        # Final safety check on numbers before formatting output
+        if any(v is None for v in [current_sga_size, target_sga_size, old_reads, new_reads]):
+             return "✅ SGA Advisor: Appropriate DB time and physical read"
+        
         read_diff = old_reads - new_reads
         
         return (f"❌Recommend to increase size from {current_sga_size:.0f} MB to {target_sga_size:.0f} MB. "
                 f"Physical Reads would decrease by {read_diff:,.0f} from {old_reads:,.0f} to {new_reads:,.0f}")
     else:
+        # If no suitable target row was found after checking all options
         return "✅ SGA Advisor: Appropriate DB time and physical read"
 
 
@@ -475,7 +539,9 @@ def analyze_thread_activity(data: List[Dict[str, Any]]) -> str:
 
 def analyze(html_path: Path) -> Dict[str, Any]:
     soup = _read_html(html_path)
+    db_time_minutes = get_db_time_from_html(soup)
     return {
+        "DB Time (minutes)": db_time_minutes,
         "Instance Efficiency Percentages (Target 100%)": parse_instance_efficiency(soup),
         "Top 10 Foreground Events by Total Wait Time":   parse_top10_foreground_events(soup),
         "SQL ordered by Elapsed Time":                   parse_sql_ordered_by_elapsed(soup),
@@ -486,6 +552,7 @@ def analyze(html_path: Path) -> Dict[str, Any]:
 
 def print_report(data: Dict[str, Any]) -> None:
     print("\n--- AWR Targeted Tables ---\n")
+    print(f"DB Time (minutes): {data.get('DB Time (minutes)', 'N/A'):.2f}\n")
     sep = "\n" + "="*70 + "\n"
     
     # Instance Efficiency
@@ -501,7 +568,7 @@ def print_report(data: Dict[str, Any]) -> None:
     if not data["Top 10 Foreground Events by Total Wait Time"]:
         print("   (Table not found or empty)")
     else:
-        print(analyze_top10_foreground_events(data["Top 10 Foreground Events by Total Wait Time"]))
+        print(analyze_top10_foreground_events(data["Top 10 Foreground Events by Total Wait Time"], data["DB Time (minutes)"]))
     print(sep)
     
     # SQL ordered by Elapsed Time

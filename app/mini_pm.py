@@ -277,14 +277,21 @@ def run_tablespace_checks(db_dir: Path, out_dir: Path) -> Tuple[str, List[Tuple[
       - full_text (for terminal and file)
       - per_file list of (pdb_name, per_file_text) from tablespace_XXX.txt -> 'XXX'
     """
+    # First, try to find files in the primary location (DB root)
     files = sorted(db_dir.glob("tablespace_*.txt"))
     buf = io.StringIO()
     per_file: List[Tuple[str, str]] = []
 
+    # If no files are found in the primary location, check the fallback location
     if not files:
-        msg = "⚠️ Skipped tablespace (no tablespace_*.txt in DB root)\n"
-        write_file(out_dir / "tablespace_report.txt", msg)
-        return msg, per_file
+        alt_path = db_dir / "auto_collection" / "tablespace_free_space.txt"
+        if alt_path.exists():
+            files = [alt_path]  # Use the fallback file
+        else:
+            # If neither the primary nor fallback files exist, then skip the check
+            msg = "⚠️ Skipped tablespace (no tablespace_*.txt in DB root or tablespace_free_space.txt in auto_collection)\n"
+            write_file(out_dir / "tablespace_report.txt", msg)
+            return msg, per_file
 
     for f in files:
         m = re.match(r"tablespace_(.+?)\.txt$", f.name, re.IGNORECASE)
@@ -324,19 +331,20 @@ def run_alert_log(db_dir: Path, out_dir: Path, map_csv: Optional[Path], alert_da
     log_dir = db_dir / "log"
     if not log_dir.exists():
         msg = "⚠️ Skipped alert log (log folder not found)\n"
-        write_file(out_dir / "alert_report.csv", "Alert code,Alert info,first occur,count,cause,action\n")
+        # Write header with new column even for skipped files
+        write_file(out_dir / "alert_report.csv", "Alert code,Alert info,first occur,last occur,count,cause,action\n")
         return msg
 
     dbname = db_dir.name
     candidates = list(log_dir.glob(f"alert_{dbname}*.log")) or list(log_dir.glob("alert_*.log"))
     if not candidates:
         msg = "⚠️ Skipped alert log (no alert_*.log found)\n"
-        write_file(out_dir / "alert_report.csv", "Alert code,Alert info,first occur,count,cause,action\n")
+        write_file(out_dir / "alert_report.csv", "Alert code,Alert info,first occur,last occur,count,cause,action\n")
         return msg
 
     if not alert_map:
         msg = "❌ alert_log_check_mapped not importable\n"
-        write_file(out_dir / "alert_report.csv", "Alert code,Alert info,first occur,count,cause,action\n")
+        write_file(out_dir / "alert_report.csv", "Alert code,Alert info,first occur,last occur,count,cause,action\n")
         return msg
 
     alert_path = candidates[0]
@@ -361,13 +369,28 @@ def run_alert_log(db_dir: Path, out_dir: Path, map_csv: Optional[Path], alert_da
                 m = ora_re.search(line)
                 if not m: continue
                 if current_ts_dt is None or current_ts_dt < since_dt: continue
+                
                 code = m.group(1).strip()
                 info = (m.group(2) or "").strip()
-                meta = agg.setdefault(code, {"first": current_ts_str, "first_dt": current_ts_dt, "info": info, "count": 0})
-                meta["count"] += 1
-                if current_ts_dt < meta["first_dt"]:
-                    meta["first_dt"] = current_ts_dt; meta["first"] = current_ts_str
-                    if info: meta["info"] = info
+
+                if code not in agg:
+                    agg[code] = {
+                        "first": current_ts_str, "first_dt": current_ts_dt,
+                        "last": current_ts_str, "last_dt": current_ts_dt,
+                        "info": info, "count": 1
+                    }
+                else:
+                    meta = agg[code]
+                    meta["count"] += 1
+                    # Update first occurrence if current is earlier
+                    if current_ts_dt < meta["first_dt"]:
+                        meta["first_dt"] = current_ts_dt
+                        meta["first"] = current_ts_str
+                        if info: meta["info"] = info
+                    # Update last occurrence if current is later
+                    if current_ts_dt > meta["last_dt"]:
+                        meta["last_dt"] = current_ts_dt
+                        meta["last"] = current_ts_str
 
         rows = sorted(agg.items(), key=lambda item: (item[1]['first'] is None, item[1]['first'] or 'ZZZ', item[0]))
         mapping = alert_map.load_mapping(str(map_csv)) if map_csv else {}
@@ -375,19 +398,20 @@ def run_alert_log(db_dir: Path, out_dir: Path, map_csv: Optional[Path], alert_da
         out_csv = out_dir / "alert_report.csv"
         with out_csv.open("w", encoding="utf-8", newline="") as f:
             w = csv.writer(f, lineterminator="\n")
-            w.writerow(["Alert code","Alert info","first occur","count","cause","action"])
+            w.writerow(["Alert code","Alert info","first occur","last occur","count","cause","action"])
             for code, meta in rows:
                 m_map = mapping.get(code, {})
                 w.writerow([
                     code,
                     (meta.get("info") or "").replace("\n"," ").replace("\r"," "),
                     meta.get("first") or "",
+                    meta.get("last") or "",  # <-- Added last occur
                     meta.get("count", 0),
                     m_map.get("cause",""),
                     m_map.get("action",""),
                 ])
 
-        header = "Alert code,Alert info,first occur,count,cause,action"
+        header = "Alert code,Alert info,first occur,last occur,count,cause,action"
         out_text_lines = [header]
         for code, meta in rows:
             m_map = mapping.get(code, {})
@@ -395,6 +419,7 @@ def run_alert_log(db_dir: Path, out_dir: Path, map_csv: Optional[Path], alert_da
                 code,
                 (meta.get("info") or "").replace(","," ").replace("\n"," ").replace("\r"," "),
                 meta.get("first") or "",
+                meta.get("last") or "",  # <-- Added last occur
                 str(meta.get("count", 0)),
                 (m_map.get("cause","") or "").replace(","," "),
                 (m_map.get("action","") or "").replace(","," "),
@@ -403,7 +428,7 @@ def run_alert_log(db_dir: Path, out_dir: Path, map_csv: Optional[Path], alert_da
 
     except Exception as e:
         msg = f"❌ Alert report failed: {e}\n"
-        write_file(out_dir / "alert_report.csv", "Alert code,Alert info,first occur,count,cause,action\n")
+        write_file(out_dir / "alert_report.csv", "Alert code,Alert info,first occur,last occur,count,cause,action\n")
         return msg
 
 def run_backups(db_dir: Path, out_dir: Path, days: int = 7) -> str:

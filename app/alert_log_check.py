@@ -6,7 +6,7 @@ def parse_alerts(fp):
     ora_re = re.compile(r'^(ORA-\d{5}):\s*(.*)$')
 
     current_ts = None
-    # key: code -> {'first': ts_or_none, 'info': info_of_first, 'count': n}
+    # key: code -> {'first': ts, 'last': ts, 'info': info, 'count': n}
     agg = {}
 
     def is_earlier(a, b):
@@ -15,6 +15,13 @@ def parse_alerts(fp):
         if a is None: return False
         if b is None: return True
         return a < b  # ISO-8601 lexicographic order works
+
+    def is_later(a, b):
+        # Compare ISO-8601 strings; handle None safely. Return True if a > b.
+        if a is None and b is None: return False
+        if a is None: return True
+        if b is None: return False
+        return a > b
 
     for raw in fp:
         line = raw.rstrip('\n')
@@ -28,10 +35,11 @@ def parse_alerts(fp):
             info = m.group(2).strip()
 
             if code not in agg:
-                agg[code] = {'first': current_ts, 'info': info, 'count': 1}
+                agg[code] = {'first': current_ts, 'last': current_ts, 'info': info, 'count': 1}
             else:
                 # bump count
                 agg[code]['count'] += 1
+                
                 # if this occurrence is earlier, update 'first' and 'info'
                 if is_earlier(current_ts, agg[code]['first']):
                     agg[code]['first'] = current_ts
@@ -40,6 +48,13 @@ def parse_alerts(fp):
                 elif agg[code]['first'] is None and current_ts is not None:
                     agg[code]['first'] = current_ts
                     agg[code]['info'] = info
+
+                # if this occurrence is later, update 'last'
+                if is_later(current_ts, agg[code]['last']):
+                    agg[code]['last'] = current_ts
+                # if existing last is None and current has ts, take it
+                elif agg[code]['last'] is None and current_ts is not None:
+                    agg[code]['last'] = current_ts
 
     return agg
 
@@ -68,11 +83,12 @@ def main():
 
     # Emit CSV
     if show_header:
-        print("Alert code,Alert info,first occur,count")
+        print("Alert code,Alert info,first occur,last occur,count")
     for code, meta in items:
         info = (meta['info'] or "").replace('\n',' ').replace('\r',' ')
         first = meta['first'] or ""
-        print(f"{code},{info},{first},{meta['count']}")
+        last = meta['last'] or ""
+        print(f"{code},{info},{first},{last},{meta['count']}")
 
 if __name__ == "__main__":
     main()
