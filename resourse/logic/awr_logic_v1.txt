@@ -1,0 +1,45 @@
+can you implement this logic to the parser script
+Preventative Maintainence: Logic
+
+Instance_efficiency = Warning on each that have hit ration < 70%
+Print format
+case normal: ✓  Hit Ratio: All statistic more than 70% or follow the same trend
+case warning: ❌ Hit Ratio: Name_of_Instance %: Hit_percent, Name_of_Instance %: Hit_percent....
+Example: ❌ Hit Ratio: Parse CPU to Parse Elapsd %: 68.85, Execute to parse %:65.33
+
+Top 10 Foreground Events by Total Wait Time = Warning Everything that have % DB time > DB CPU && > 20%
+Print format
+case normal: ✓ Wait event: No concerning wait event with significant DB time more than CPU timeng running SQL with significant running time or wait
+case warning: ❌: Event1 ____% DB Time,Event2 ____% DB Time
+Example: ❌direct path read temp: 39.9% DB Time
+
+SQL ordered by Elapsed Time = Warning for elapsed_time_s > 100,000 or Elapsed Time per Exec (s) > 3,000 or Elapsed Time per Exec (s) > 100 & Executions > 100
+Print format
+case normal:✓  Top Running SQL: There is concerning running SQL with significant running time or wait
+case warning: ❌Concerning running SQL with significant running time or wait  sql_id: sql_id_1,sql_id_2,...
+Example:❌Concerning running SQL with significant running time or wait  sql_id:3xh4xvu0v7fs9,8312n5h9yx6gy,
+
+
+SGA Target Advisory = For factor f > 1.00, require either Est DB Time or Est Physical Reads 
+to improve by at least 1.5 * (f - 1.0). Return the smallest SGA that meets the rule. rows: list[dict] with keys like:
+'SGA Target Size (M)', 'SGA Size Factor', 'Est DB Time (s)', 'Est Physical Reads'
+Pick the smallest PGA size that meets the rule
+Print format
+case normal:✓ SGA Advisor: Appropriate DB time and physical read
+case warning: ❌Recommend to increase size from (Factor 1.00) MB to (targetsize) MB
+Example: ❌Recommend to increase size from 4,096 MB to5,632 MB
+
+
+PGA Memory Advisory = For Estd Extra W/A MB Read/ Written to Disk row with Size Factor = f > 1.00, require: Estd Extra W/A MB Read/Written to Disk improves by at least 1.5 × (f − 1.0)
+Pick the smallest PGA size that meets the rule
+(i.e., it decreases by that percentage vs current)
+Print format
+case normal:✓ PGA Advisor: Appropriate DB time and physical read
+case warning: Recommend to increase size from (Factor 1.00) MB to (targetsize) MB
+Example: ❌ PGA Advisor:  Recommend to increase size from 2,024 MB to 2,429 MB
+
+Instance Activity Stats - Thread Activity = per Hour < 4
+Print format
+
+case warning:❌ Redo Log switch: Redo log switch more than 4 times per hour
+

@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+AWR Parser (targeted tables only)
+
+Extracts and prints:
+  1) Instance Efficiency Percentages (Target 100%)
+  2) Top 10 Foreground Events by Total Wait Time
+  3) SQL ordered by Elapsed Time
+  4) PGA Memory Advisory
+  5) SGA Target Advisory
+"""
+
+import argparse
+import re
+from io import StringIO
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+from bs4 import BeautifulSoup, NavigableString, Tag
+
+
+
+# ---------- helpers ----------
+
+def _read_html(path: Path) -> BeautifulSoup:
+    html = path.read_text(encoding="utf-8", errors="ignore")
+    return BeautifulSoup(html, "html.parser")
+
+def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.map(" ".join)
+    df.columns = [str(c).replace("\xa0", " ").strip() for c in df.columns]
+    # de-dup column names to avoid pandas dropping duplicates
+    seen = {}
+    new_cols = []
+    for c in df.columns:
+        if c in seen:
+            seen[c] += 1
+            new_cols.append(f"{c}.{seen[c]}")
+        else:
+            seen[c] = 0
+            new_cols.append(c)
+    df.columns = new_cols
+    return df
+
+_num_pat = re.compile(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
+
+def _num(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    s = str(x).replace(",", "").replace("%", "").strip()
+    m = _num_pat.search(s)
+    return float(m.group(1)) if m else None
+
+def _contains_any(text: str, needles: List[str]) -> bool:
+    t = text.lower()
+    return any(n.lower() in t for n in needles)
+
+def _table_to_df(table: Tag) -> Optional[pd.DataFrame]:
+    try:
+        return pd.read_html(StringIO(str(table)), flavor="lxml")[0]
+    except Exception:
+        try:
+            return pd.read_html(StringIO(str(table)))[0]
+        except Exception:
+            return None
+
+def _find_table_by_summary(soup: BeautifulSoup, summary_patterns: List[str]) -> Optional[pd.DataFrame]:
+    for tbl in soup.find_all("table"):
+        summary = (tbl.get("summary") or "").lower()
+        if any(re.search(pat, summary) for pat in summary_patterns):
+            df = _table_to_df(tbl)
+            if df is not None and not df.empty:
+                return _clean_cols(df)
+    return None
+
+def _find_table_by_title_then_next_table(soup: BeautifulSoup, title_patterns: List[str]) -> Optional[pd.DataFrame]:
+    # match anywhere in the document (text or tag)
+    def text_matches(node) -> bool:
+        try:
+            return isinstance(node, (Tag, NavigableString)) and _contains_any(str(node), title_patterns)
+        except Exception:
+            return False
+
+    anchor = soup.find(text_matches)
+    if not anchor:
+        return None
+    start = anchor if isinstance(anchor, Tag) else (anchor.parent if hasattr(anchor, "parent") else None)
+    if not start:
+        return None
+
+    nxt = start.find_next("table")
+    if not nxt:
+        return None
+    df = _table_to_df(nxt)
+    return _clean_cols(df) if df is not None and not df.empty else None
+
+
+# ---------- section parsers ----------
+
+def parse_instance_efficiency(soup: BeautifulSoup) -> Dict[str, Optional[float]]:
+    # Prefer table summary (reliable in your file)
+    df = _find_table_by_summary(
+        soup,
+        [r"instance\s+efficiency\s+percentages"]  # case-insensitive regex
+    )
+    # Fallback: title then next table
+    if df is None:
+        df = _find_table_by_title_then_next_table(
+            soup,
+            ["Instance Efficiency Percentages"]
+        )
+    if df is None or df.empty:
+        return {}
+
+    # This table is usually 2 metrics per row: metric:value metric:value
+    out: Dict[str, Optional[float]] = {}
+    for _, row in df.iterrows():
+        values = [str(v).strip() for v in row.values]
+        # walk pairs
+        for i in range(0, len(values), 2):
+            try:
+                metric = values[i]
+                val = values[i + 1] if i + 1 < len(values) else None
+            except Exception:
+                continue
+            if not metric or ":" not in metric:
+                # some AWRs omit the colon in headers; tolerate both
+                pass
+            # keep only rows that look like percentages we care about
+            if _contains_any(metric, ["Hit %", "Parse", "Latch", "Redo", "Buffer", "Library", "Flash Cache"]):
+                out[metric.replace(":", "")] = _num(val)
+    return out
+
+def parse_top10_foreground_events(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    df = _find_table_by_summary(
+        soup,
+        [r"top\s+10.*wait\s+events.*total\s+wait\s+time"]
+    )
+    if df is None:
+        df = _find_table_by_title_then_next_table(
+            soup, ["Top 10 Foreground Events by Total Wait Time"]
+        )
+    if df is None or df.empty:
+        return []
+
+    df = _clean_cols(df)
+    # rename common columns
+    ren = {}
+    for c in df.columns:
+        lc = c.lower()
+        if "event" in lc and "class" not in lc:
+            ren[c] = "event"
+        elif "waits" in lc:
+            ren[c] = "waits"
+        elif "total wait" in lc or ("time" in lc and "(sec" in lc):
+            ren[c] = "total_wait_time_s"
+        elif "avg wait" in lc:
+            ren[c] = "avg_wait"
+        elif "% db time" in lc:
+            ren[c] = "pct_db_time"
+        elif "wait class" in lc:
+            ren[c] = "wait_class"
+    df = df.rename(columns=ren)
+    keep = [c for c in ["event", "waits", "total_wait_time_s", "avg_wait", "pct_db_time", "wait_class"] if c in df.columns]
+
+    # numeric conversions
+    for c in ["waits", "total_wait_time_s", "pct_db_time"]:
+        if c in df.columns:
+            df[c] = df[c].map(_num)
+
+    return df[keep].head(10).to_dict(orient="records")
+
+def parse_sql_ordered_by_elapsed(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """
+    Find and return only the 'SQL ordered by Elapsed Time' rows (top 10).
+    Strategy: read all tables -> pick those that look like the Elapsed Time SQL table
+    (must contain SQL ID + Elapsed Time columns), handle duplicate headers, clean numbers.
+    """
+    from io import StringIO
+
+    # Read ALL tables once (avoids title/anchor brittleness)
+    try:
+        dfs = pd.read_html(StringIO(str(soup)), flavor="lxml")
+    except Exception:
+        try:
+            dfs = pd.read_html(StringIO(str(soup)))
+        except Exception:
+            return []
+
+    def _has_anycell(df: pd.DataFrame, needles: List[str]) -> bool:
+        # headers
+        for col in df.columns:
+            if _contains_any(str(col), needles):
+                return True
+        # a few stringy cells
+        for _, row in df.head(20).iterrows():
+            for v in row.values:
+                if isinstance(v, str) and _contains_any(v, needles):
+                    return True
+        return False
+
+    wanted = []
+    for df in dfs:
+        df = _clean_cols(df)
+        # quick filter: must look like the "Elapsed Time" SQL table
+        if not _has_anycell(df, ["sql id", "sqlid", "sql_id"]):
+            continue
+        if not _has_anycell(df, ["elapsed time"]):  # focus ONLY elapsed-time table
+            continue
+
+        # De-dup duplicate column names so pandas doesn't drop them
+        seen, new_cols = {}, []
+        for c in df.columns:
+            c = str(c).strip()
+            if c in seen:
+                seen[c] += 1
+                new_cols.append(f"{c}.{seen[c]}")
+            else:
+                seen[c] = 0
+                new_cols.append(c)
+        cdf = df.copy()
+        cdf.columns = new_cols
+
+        # Normalize/rename columns we care about
+        rename_map = {}
+        for c in cdf.columns:
+            lc = re.sub(r"\s+", " ", str(c)).strip().lower()
+            if "sql id" in lc or lc == "sqlid" or "sql_id" in lc:
+                rename_map[c] = "sql_id"
+            elif ("elapsed time" in lc and "/exec" in lc) or "elapsed time per exec" in lc:
+                rename_map[c] = "elapsed_per_exec_s"
+            elif ("elapsed time" in lc) and ("(s" in lc or "sec" in lc or "time (s)" in lc):
+                rename_map[c] = "elapsed_time_s"
+            elif "executions" in lc:
+                rename_map[c] = "executions"
+            elif "%total" in lc and "elapsed" in lc:
+                rename_map[c] = "pct_total_elapsed"
+
+        cdf = cdf.rename(columns=rename_map)
+
+        # Require sql_id and some elapsed time signal
+        if "sql_id" not in cdf.columns:
+            continue
+        if not (("elapsed_time_s" in cdf.columns) or ("elapsed_per_exec_s" in cdf.columns)):
+            continue
+
+        keep = [c for c in ["sql_id", "elapsed_time_s", "executions", "elapsed_per_exec_s", "pct_total_elapsed"]
+                if c in cdf.columns]
+        trimmed = cdf[keep].head(10).copy()
+
+        # Numeric cleanup
+        for col in trimmed.columns:
+            if col != "sql_id":
+                trimmed[col] = trimmed[col].map(_num)
+
+        wanted.append(trimmed)
+
+    if not wanted:
+        return []
+
+    out = pd.concat(wanted, ignore_index=True)
+    # drop duplicates by sql_id (keep first)
+    if "sql_id" in out.columns:
+        out = out.drop_duplicates(subset=["sql_id"], keep="first")
+
+    return out.to_dict(orient="records")
+
+
+def parse_pga_memory_advisory(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """
+    Return the FULL 'PGA Memory Advisory' / 'PGA Aggregate Target Advisory' table.
+    Keeps every column exactly as shown in the AWR (after header cleaning + de-dupe).
+    """
+    df = _find_table_by_summary(soup, [r"pga.*advisory"])
+    if df is None:
+        df = _find_table_by_title_then_next_table(
+            soup, ["PGA Memory Advisory", "PGA Aggregate Target Advisory"]
+        )
+    if df is None or df.empty:
+        return []
+    df = _clean_cols(df)
+    # Return every column untouched (numeric conversion skipped to preserve raw values/units)
+    return df.to_dict(orient="records")
+
+
+def parse_sga_target_advisory(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """
+    Return the FULL 'SGA Target Advisory' table.
+    Keeps every column exactly as shown in the AWR (after header cleaning + de-dupe).
+    """
+    df = _find_table_by_summary(soup, [r"sga.*target.*advisory"])
+    if df is None:
+        df = _find_table_by_title_then_next_table(soup, ["SGA Target Advisory"])
+    if df is None or df.empty:
+        return []
+    df = _clean_cols(df)
+    # Return every column untouched (numeric conversion skipped to preserve raw values/units)
+    return df.to_dict(orient="records")
+
+def parse_instance_thread_activity(soup: BeautifulSoup) -> List[Dict[str, Any]]:
+    """
+    Parse 'Instance Activity Stats - Thread Activity' (Statistic | Total | per Hour).
+    Returns the full table as a list of dicts.
+    """
+    # Prefer the table's summary attribute (most reliable)
+    df = _find_table_by_summary(
+        soup,
+        [r"thread\s+activity\s+stats"]  # matches: "This table displays thread activity stats..."
+    )
+    # Fallback: match the section title then grab the next table
+    if df is None:
+        df = _find_table_by_title_then_next_table(
+            soup, ["Instance Activity Stats - Thread Activity"]
+        )
+
+    if df is None or df.empty:
+        return []
+
+    df = _clean_cols(df)  # de-dup/normalize headers
+    # Keep columns as-is so you see exactly what AWR shows
+    return df.to_dict(orient="records")
+
+
+
+# ---------- orchestration & printing ----------
+
+def analyze(html_path: Path) -> Dict[str, Any]:
+    soup = _read_html(html_path)
+    return {
+        "Instance Efficiency Percentages (Target 100%)": parse_instance_efficiency(soup),
+        "Top 10 Foreground Events by Total Wait Time":   parse_top10_foreground_events(soup),
+        "SQL ordered by Elapsed Time":                   parse_sql_ordered_by_elapsed(soup),
+        "PGA Memory Advisory":                           parse_pga_memory_advisory(soup),
+        "SGA Target Advisory":                           parse_sga_target_advisory(soup),
+        "Instance Activity Stats - Thread Activity":     parse_instance_thread_activity(soup),
+    }
+
+def print_report(data: Dict[str, Any]) -> None:
+    print("\n--- AWR Targeted Tables ---\n")
+    sep = "\n" + "="*70 + "\n"
+    for title, payload in data.items():
+        print(f"## {title}\n")
+        if not payload:
+            print("   (Table not found or empty)")
+        elif isinstance(payload, dict):
+            for k, v in sorted(payload.items()):
+                print(f"   - {k}: {v:.2f}" if v is not None else f"   - {k}: (n/a)")
+        else:
+            df = pd.DataFrame(payload)
+            # pretty numbers
+            for col in df.select_dtypes(include="number").columns:
+                df[col] = df[col].map(lambda x: f"{x:.2f}")
+            print(df.to_string(index=False))
+        print(sep)
+
+def main():
+    ap = argparse.ArgumentParser(description="Parse selected tables from an Oracle AWR HTML report.")
+    ap.add_argument("html_path", type=str, help="Path to AWR HTML report")
+    args = ap.parse_args()
+
+    path = Path(args.html_path)
+    if not path.exists():
+        raise SystemExit(f"File not found: {path}")
+
+    data = analyze(path)
+    print_report(data)
+
+if __name__ == "__main__":
+    main()

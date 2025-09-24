@@ -1,0 +1,8 @@
+1.Instance_efficiency: can also check trend
+2(?).Top 10 Foreground Events by Total Wait Time:if db time less than 50 skip this section , remove 20% condition
+3.new condition sga: add if sga size increase less than 1gb && Est Physical Reads decrease more than 10,000,000
+✅4.when sort awr copy top 3 instead of only top 1 change file name to this format (top1_dbtime)filename,(top2_dbtime)filename,(top3_dbtime)filename
+example (top1_150)awrrpt_1_1260_1272.html
+5.alert log last occur
+6.node 2 alert log
+7.if can't find free_space tablespace_*.txt in DB root go into auto_collection_folder and look for tablespace_free_space.txt instead
