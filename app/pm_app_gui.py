@@ -56,7 +56,22 @@ class PMApp(tk.Tk):
         tk.Label(self, text="Input (ZIP or folder):").grid(row=row, column=0, sticky="e", padx=6, pady=6)
         self.inp_var = tk.StringVar()
         tk.Entry(self, textvariable=self.inp_var, width=70).grid(row=row, column=1, sticky="we", padx=6, pady=6)
-        tk.Button(self, text="Browse…", command=self.browse_input).grid(row=row, column=2, padx=6, pady=6)
+        tk.Button(self, text="ZIP…", command=self.browse_input_zip).grid(row=row, column=2, padx=3, pady=6)
+        tk.Button(self, text="Folder…", command=self.browse_input_folder).grid(row=row, column=3, padx=3, pady=6)
+
+        row += 1
+        tk.Label(self, text="Node 2 (ZIP/folder, alert-only):").grid(row=row, column=0, sticky="e", padx=6, pady=6)
+        self.node2_var = tk.StringVar()
+        tk.Entry(self, textvariable=self.node2_var, width=70).grid(row=row, column=1, sticky="we", padx=6, pady=6)
+        tk.Button(self, text="ZIP…", command=self.browse_node2_zip).grid(row=row, column=2, padx=3, pady=6)
+        tk.Button(self, text="Folder…", command=self.browse_node2_folder).grid(row=row, column=3, padx=3, pady=6)
+
+        row += 1
+        tk.Label(self, text="Old base (ZIP/folder, AWR-only):").grid(row=row, column=0, sticky="e", padx=6, pady=6)
+        self.old_var = tk.StringVar()
+        tk.Entry(self, textvariable=self.old_var, width=70).grid(row=row, column=1, sticky="we", padx=6, pady=6)
+        tk.Button(self, text="ZIP…", command=self.browse_old_zip).grid(row=row, column=2, padx=3, pady=6)
+        tk.Button(self, text="Folder…", command=self.browse_old_folder).grid(row=row, column=3, padx=3, pady=6)
 
         row += 1
         tk.Label(self, text="Mapping CSV (ora_code_table.csv):").grid(row=row, column=0, sticky="e", padx=6, pady=6)
@@ -92,7 +107,7 @@ class PMApp(tk.Tk):
         row += 1
         tk.Label(self, text="Console output:").grid(row=row, column=0, sticky="ne", padx=6, pady=6)
         self.console = ScrolledText(self, wrap=tk.WORD, height=25)
-        self.console.grid(row=row, column=1, columnspan=2, sticky="nsew", padx=6, pady=6)
+        self.console.grid(row=row, column=1, columnspan=3, sticky="nsew", padx=6, pady=6)
 
         # Grid weights
         self.grid_columnconfigure(1, weight=1)
@@ -101,16 +116,35 @@ class PMApp(tk.Tk):
         self._last_out_dir = None
         self._runner_thread = None
 
-    def browse_input(self):
-        # allow file or folder
-        f = filedialog.askopenfilename(title="Choose ZIP or any file inside the folder")
+    def browse_input_zip(self):
+        f = filedialog.askopenfilename(title="Choose ZIP file", filetypes=[("ZIP files","*.zip"),("All files","*.*")])
         if f:
             self.inp_var.set(f)
-        else:
-            # maybe choose a directory instead
-            d = filedialog.askdirectory(title="Choose extracted folder")
-            if d:
-                self.inp_var.set(d)
+
+    def browse_input_folder(self):
+        d = filedialog.askdirectory(title="Choose extracted folder")
+        if d:
+            self.inp_var.set(d)
+
+    def browse_node2_zip(self):
+        f = filedialog.askopenfilename(title="Choose ZIP file", filetypes=[("ZIP files","*.zip"),("All files","*.*")])
+        if f:
+            self.node2_var.set(f)
+
+    def browse_node2_folder(self):
+        d = filedialog.askdirectory(title="Choose extracted folder")
+        if d:
+            self.node2_var.set(d)
+
+    def browse_old_zip(self):
+        f = filedialog.askopenfilename(title="Choose ZIP file", filetypes=[("ZIP files","*.zip"),("All files","*.*")])
+        if f:
+            self.old_var.set(f)
+
+    def browse_old_folder(self):
+        d = filedialog.askdirectory(title="Choose extracted folder")
+        if d:
+            self.old_var.set(d)
 
     def browse_map(self):
         f = filedialog.askopenfilename(title="Choose ora_code_table.csv", filetypes=[("CSV files","*.csv"),("All files","*.*")])
@@ -126,7 +160,7 @@ class PMApp(tk.Tk):
         path = Path(self.out_var.get())
         try:
             if os.name == "nt":
-                os.startfile(str(path))  # type: ignore[attr-defined]
+                os.startfile(str(path))
             elif sys.platform == "darwin":
                 os.system(f'open "{path}"')
             else:
@@ -135,7 +169,7 @@ class PMApp(tk.Tk):
             messagebox.showerror("Open folder", f"Could not open folder:\n{e}")
 
     def run_clicked(self):
-        # Validate
+        # Validate inputs
         input_path = Path(self.inp_var.get().strip('"'))
         if not input_path.exists():
             messagebox.showerror("Input", "Input ZIP/folder does not exist.")
@@ -151,12 +185,14 @@ class PMApp(tk.Tk):
             alert_days = int(self.days_var.get())
             if alert_days <= 0:
                 raise ValueError
-        except Exception:
+        except ValueError:
             messagebox.showerror("Alert days", "Please enter a positive integer for 'Alert days'.")
             return
 
         target_ver = self.ver_var.get().strip() or "19.27"
         out_root = Path(self.out_var.get().strip() or (Path.cwd() / "mini_pm_report"))
+        node2_path_str = self.node2_var.get().strip('"').strip()
+        old_path_str = self.old_var.get().strip('"').strip()
         out_root.mkdir(parents=True, exist_ok=True)
         self._last_out_dir = out_root
 
@@ -178,6 +214,8 @@ class PMApp(tk.Tk):
                     target_version=target_ver,
                     report_root=out_root,
                     alert_days=alert_days,
+                    node2_input=Path(node2_path_str) if node2_path_str else None,
+                    old_input=Path(old_path_str) if old_path_str else None,
                 )
                 self.console.after(0, lambda: self.open_btn.config(state=tk.NORMAL))
             except Exception:

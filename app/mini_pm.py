@@ -134,6 +134,13 @@ def _desc_lines_from(text: str, max_lines: int=12) -> str:
     lines = [ln for ln in text.splitlines() if ln.strip() and "====" not in ln]
     return "\n".join(lines[:max_lines])
 
+# --- Normalize DB folder name for node pairing (strip a single node suffix like -1/_2/NODE1) ---
+def _normalize_db_name(name: str) -> str:
+    s = name.strip()
+    # remove a single trailing node suffix variations: "-1", "_2", "node1", "node2", "01", "02"
+    s = re.sub(r'(?i)(?:[\-_ ]?(?:node)?[\-_ ]?(?:0)?[12])$', '', s)
+    return s.upper()
+
 def severity_config(text: str) -> int:
     t = text.lower()
     bad_ctrl = "❌ control file" in t
@@ -271,6 +278,190 @@ def run_awr(db_dir: Path, out_dir: Path, copy_selected_to: Optional[Path]=None) 
 
     text = buf.getvalue(); write_file(out_dir / "awr_analysis.txt", text); return best, text
 
+
+def _select_best_awr(db_dir: Path):
+    """Return best AWR html Path or None using the same scoring as run_awr."""
+    report_dir = db_dir / "report"
+    if not report_dir.exists():
+        return None
+    htmls = list(report_dir.glob("*.html"))
+    if not htmls:
+        return None
+    scored = [(score_awr(h), h) for h in htmls]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1] if scored else None
+
+def _render_awr_text(html_path: Path) -> str:
+    """Use awr_analyzer to analyze and render text like run_awr."""
+    import io, sys
+    if not (awr_analyzer and html_path and html_path.exists()):
+        return ""
+    try:
+        data = awr_analyzer.analyze(html_path)
+        _stdout = sys.stdout; sys.stdout = io.StringIO()
+        awr_analyzer.print_report(data)
+        rendered = sys.stdout.getvalue(); sys.stdout = _stdout
+        return rendered
+    except Exception:
+        try: sys.stdout = _stdout
+        except Exception: pass
+        return ""
+
+# Match lines like:
+#  "❌ Hit Ratio: Buffer Hit %: 23.10"
+#  "Hit Ratio: Library Hit %: 68.2"
+_IE_LINE_RE = re.compile(r'^(?P<prefix>.*?(?:Hit\\s*Ratio|Instance\\s*Efficiency)[^:]*?:\\s*[^:]*?:\\s*)(?P<val>\\d+(?:\\.\\d+)?)\\s*%(?P<suffix>.*)$', re.I)
+
+def _append_old_instance_efficiency(current_text: str, old_text: str) -> str:
+    """
+    For any Instance Efficiency metric under 70% in current_text, append old value:
+      '... Hit Ratio: Buffer Hit %: 23.10' -> '... Hit Ratio: Buffer Hit %: 23.10 (Old Hit Ratio: Buffer Hit %: 85.67)'
+    Matching uses the 'prefix' (text up to the percentage value).
+    """
+    if not old_text:
+        return current_text
+    lines = current_text.splitlines()
+    out_lines = []
+    for ln in lines:
+        stripped = ln.strip()
+        m = _IE_LINE_RE.match(stripped)
+        if not m:
+            out_lines.append(ln); continue
+        try:
+            val = float(m.group("val"))
+        except Exception:
+            out_lines.append(ln); continue
+        if val >= 70.0:
+            out_lines.append(ln); continue
+        label = m.group("prefix")
+        # Find old match
+        old_val_str = None
+        for old_ln in old_text.splitlines():
+            if old_ln.strip().startswith(label):
+                mo = _IE_LINE_RE.match(old_ln.strip())
+                if mo:
+                    old_val_str = mo.group("val")
+                    break
+        if old_val_str is not None:
+            enhanced = f"{ln} (Old {label}{old_val_str})"
+            out_lines.append(enhanced)
+        else:
+            out_lines.append(ln)
+    return "\n".join(out_lines)
+
+
+# === Improved Instance Efficiency trend helpers (override) ===
+def _normalize_key(s: str) -> str:
+    s = s.strip()
+    s = s.replace("❌", "").replace("✅", "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
+
+def _extract_ie_pairs(text: str) -> dict:
+    pairs = {}
+    if not text:
+        return pairs
+    for line in text.splitlines():
+        raw = line.strip()
+        if "%" not in raw:
+            continue
+        ctx = ""
+        if re.search(r'\bHit\s*Ratio\b', raw, re.I):
+            ctx = "Hit Ratio"
+        elif re.search(r'\bInstance\s*Efficiency\b', raw, re.I):
+            ctx = "Instance Efficiency"
+        for m in re.finditer(r'(?P<label>[A-Za-z][^:%]*?%\s*):\s*(?P<val>\d+(?:\.\d+)?)', raw):
+            label = m.group("label").strip().rstrip(",")
+            key = _normalize_key((ctx + " " + label).strip() if ctx else label)
+            pairs[key] = m.group("val")
+    return pairs
+
+def _append_old_instance_efficiency(current_text: str, old_text: str) -> str:
+    if not old_text:
+        return current_text
+    old_pairs = _extract_ie_pairs(old_text)
+    out_lines = []
+    for line in current_text.splitlines():
+        raw = line
+        if "%" not in raw:
+            out_lines.append(raw); continue
+        ctx = ""
+        if re.search(r'\bHit\s*Ratio\b', raw, re.I):
+            ctx = "Hit Ratio"
+        elif re.search(r'\bInstance\s*Efficiency\b', raw, re.I):
+            ctx = "Instance Efficiency"
+        def repl(m):
+            label = m.group("label").strip().rstrip(",")
+            val_s = m.group("val")
+            try:
+                val_f = float(val_s)
+            except Exception:
+                return m.group(0)
+            if val_f >= 70.0:
+                return m.group(0)
+            key = _normalize_key((ctx + " " + label).strip() if ctx else label)
+            old_val = old_pairs.get(key) or old_pairs.get(_normalize_key(label))
+            if old_val:
+                return f"{label}: {val_s} (Old {label}: {old_val})"
+            else:
+                return m.group(0)
+        new_line = re.sub(r'(?P<label>[A-Za-z][^:%]*?%\s*):\s*(?P<val>\d+(?:\.\d+)?)', repl, raw)
+        out_lines.append(new_line)
+    return "\n".join(out_lines)
+
+def _normalize_metric_key(label: str) -> str:
+    """Normalize a metric label like 'Buffer Hit %' -> 'buffer hit %' (collapse spaces)."""
+    s = label or ""
+    s = s.replace("❌","" ).replace("✅","" )
+    s = re.sub(r"[:\s]+", " ", s).strip().lower()
+    return s
+
+def _append_old_ie_using_dict(current_text: str, old_pairs: dict) -> str:
+    """
+    Append old Instance Efficiency values using a structured dict from
+    awr_analyzer.parse_instance_efficiency().
+
+    Rule: If the *current* metric value < 70, always append the old value when
+    available, regardless of the old value.
+    """
+    if not old_pairs:
+        return current_text
+
+    # Build normalized lookup
+    old_lookup = {}
+    for k, v in (old_pairs or {}).items():
+        try:
+            if v is None:
+                continue
+            old_lookup[_normalize_metric_key(str(k))] = float(v)
+        except Exception:
+            continue
+
+    def repl(m):
+        label = m.group("label").strip().rstrip(",")
+        val_s = m.group("val")
+        try:
+            val_f = float(val_s)
+        except Exception:
+            return m.group(0)
+        if val_f >= 70.0:
+            return m.group(0)
+        key = _normalize_metric_key(label)
+        if key in old_lookup:
+            return f"{label}: {val_s} (Old {label}: {old_lookup[key]:.2f})"
+        return m.group(0)
+
+    out_lines = []
+    for raw in current_text.splitlines():
+        if "%" in raw:
+            new_line = re.sub(r'(?P<label>[A-Za-z][^:%]*?%\s*):\s*(?P<val>\d+(?:\.\d+)?)', repl, raw)
+            out_lines.append(new_line)
+        else:
+            out_lines.append(raw)
+    return "\n".join(out_lines)
+# === End improved helpers ===
+
+
 def run_tablespace_checks(db_dir: Path, out_dir: Path) -> Tuple[str, List[Tuple[str, str]]]:
     """
     Returns:
@@ -337,6 +528,9 @@ def run_alert_log(db_dir: Path, out_dir: Path, map_csv: Optional[Path], alert_da
 
     dbname = db_dir.name
     candidates = list(log_dir.glob(f"alert_{dbname}*.log")) or list(log_dir.glob("alert_*.log"))
+    print(f"[debug] DB dir: {db_dir}")
+    print(f"[debug] Log dir: {log_dir}")
+    print(f"[debug] Candidate logs: {[c.name for c in candidates]}")
     if not candidates:
         msg = "⚠️ Skipped alert log (no alert_*.log found)\n"
         write_file(out_dir / "alert_report.csv", "Alert code,Alert info,first occur,last occur,count,cause,action\n")
@@ -348,6 +542,7 @@ def run_alert_log(db_dir: Path, out_dir: Path, map_csv: Optional[Path], alert_da
         return msg
 
     alert_path = candidates[0]
+    print(f"[debug] Using alert file: {alert_path}")
     now_local = datetime.now().astimezone()
     local_tz = now_local.tzinfo
     since_dt = now_local - timedelta(days=alert_days)
@@ -430,6 +625,148 @@ def run_alert_log(db_dir: Path, out_dir: Path, map_csv: Optional[Path], alert_da
         msg = f"❌ Alert report failed: {e}\n"
         write_file(out_dir / "alert_report.csv", "Alert code,Alert info,first occur,last occur,count,cause,action\n")
         return msg
+
+# ---- Node2 helpers ----
+def run_alert_log_custom(db_dir: Path, out_dir: Path, map_csv: Optional[Path], alert_days: int, out_name: str) -> str:
+    """
+    Wrapper around run_alert_log but writes to a custom CSV filename in out_dir.
+    Returns the CSV-as-text that run_alert_log prints.
+    IMPORTANT: snapshots existing alert_report.csv and restores it to avoid overwriting node1.
+    """
+    default_csv = out_dir / "alert_report.csv"
+    snapshot = None
+    if default_csv.exists():
+        try:
+            snapshot = default_csv.read_text(encoding="utf-8")
+        except Exception:
+            snapshot = None
+
+    text = run_alert_log(db_dir, out_dir, map_csv, alert_days=alert_days)
+
+    # Copy to custom name (node2) and then restore snapshot
+    custom_csv = out_dir / out_name
+    try:
+        if default_csv.exists():
+            custom_csv.write_text(default_csv.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            custom_csv.write_text("Alert code,Alert info,first occur,last occur,count,cause,action\n", encoding="utf-8")
+    except Exception as e:
+        print(f"[debug] Failed to write {custom_csv}: {e}")
+
+    # Restore node1 CSV if we had a snapshot
+    if snapshot is not None:
+        try:
+            default_csv.write_text(snapshot, encoding="utf-8")
+            print("[debug] Restored alert_report.csv after node2 processing")
+        except Exception as e:
+            print(f"[debug] Failed to restore alert_report.csv: {e}")
+
+    return text
+
+
+def combine_alert_csvs(csv1: Path, csv2: Path, out_csv: Path) -> None:
+    """
+    Combine node1 (csv1) and node2 (csv2) alerts by 'Alert code' without pandas.
+    Output columns:
+      Alert code,Alert info,first occur node,last occur node,first occur,last occur,count,cause,action
+    - first/last occur node: "node1" or "node2" depending on which node had the min/max timestamp.
+    - first/last occur: ISO strings kept as-is from inputs.
+    - count: sum of counts.
+    - info/cause/action: prefer non-empty from node1, else node2.
+    """
+    import csv
+    from datetime import datetime
+
+    header_in = ["Alert code","Alert info","first occur","last occur","count","cause","action"]
+    header_out = ["Alert code","Alert info","first occur node","last occur node","first occur","last occur","count","cause","action"]
+
+    def read_csv(path: Path):
+        data = {}
+        if not path.exists():
+            return data
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                code = (row.get("Alert code") or "").strip()
+                if not code:
+                    continue
+                # normalize fields
+                rec = {
+                    "info": (row.get("Alert info") or "").strip(),
+                    "first": (row.get("first occur") or "").strip(),
+                    "last":  (row.get("last occur")  or "").strip(),
+                    "count": int(str(row.get("count") or "0").strip() or 0),
+                    "cause": (row.get("cause") or "").strip(),
+                    "action":(row.get("action") or "").strip(),
+                }
+                data[code] = rec
+        return data
+
+    def parse_ts(s: str):
+        # Try multiple formats but keep as comparable strings if parse fails
+        if not s:
+            return None
+        try:
+            # Most inputs are ISO-like; fromisoformat handles 'YYYY-MM-DDTHH:MM:SS' variants
+            return datetime.fromisoformat(s.replace("Z","+00:00")) if ("T" in s or "-" in s) else None
+        except Exception:
+            return None
+
+    d1 = read_csv(csv1)  # node1
+    d2 = read_csv(csv2)  # node2
+
+    codes = sorted(set(d1.keys()) | set(d2.keys()))
+    rows = []
+
+    for code in codes:
+        r1 = d1.get(code, {})
+        r2 = d2.get(code, {})
+
+        info  = r1.get("info") or r2.get("info") or ""
+        cause = r1.get("cause") or r2.get("cause") or ""
+        action= r1.get("action") or r2.get("action") or ""
+        count = (r1.get("count",0) or 0) + (r2.get("count",0) or 0)
+
+        f1, f2 = r1.get("first",""), r2.get("first","")
+        l1, l2 = r1.get("last",""),  r2.get("last","")
+
+        # Determine first occur across nodes
+        f1_dt, f2_dt = parse_ts(f1), parse_ts(f2)
+        if f1 and f2:
+            if (f1_dt and f2_dt):
+                first, first_node = (f1, "node1") if f1_dt <= f2_dt else (f2, "node2")
+            else:
+                # fallback lexical compare
+                first, first_node = (f1, "node1") if f1 <= f2 else (f2, "node2")
+        elif f1:
+            first, first_node = f1, "node1"
+        elif f2:
+            first, first_node = f2, "node2"
+        else:
+            first, first_node = "", ""
+
+        # Determine last occur across nodes
+        l1_dt, l2_dt = parse_ts(l1), parse_ts(l2)
+        if l1 and l2:
+            if (l1_dt and l2_dt):
+                last, last_node = (l1, "node1") if l1_dt >= l2_dt else (l2, "node2")
+            else:
+                last, last_node = (l1, "node1") if l1 >= l2 else (l2, "node2")
+        elif l1:
+            last, last_node = l1, "node1"
+        elif l2:
+            last, last_node = l2, "node2"
+        else:
+            last, last_node = "", ""
+
+        rows.append([code, info, first_node, last_node, first, last, count, cause, action])
+
+    with out_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, lineterminator="\n")
+        writer.writerow(header_out)
+        for r in rows:
+            writer.writerow(r)
+
 
 def run_backups(db_dir: Path, out_dir: Path, days: int = 7) -> str:
     backup_dir = db_dir / "auto_collection" / "backup"; buf = io.StringIO()
@@ -547,7 +884,7 @@ def _write_excel(rows: List[Dict[str,str]], out_path: Path):
         ws.set_column("G:G", None, None, {'hidden': True})
 
 # ------------- Orchestrate -------------
-def run_all(input_path: Path, map_csv: Optional[Path], target_version: str, report_root: Path, alert_days: int) -> None:
+def run_all(input_path: Path, map_csv: Optional[Path], target_version: str, report_root: Path, alert_days: int, node2_input: Optional[Path] = None, old_input: Optional[Path] = None) -> None:
     # We still show the top label in console/summary, but Excel 'System Name' = CDB folder
     if is_zip(input_path):
         print(f"→ Extracting zip: {input_path}")
@@ -562,6 +899,41 @@ def run_all(input_path: Path, map_csv: Optional[Path], target_version: str, repo
     if not db_dirs:
         print("No database folders found (need subfolders with auto_collection/report/log).")
         return
+
+    # Optional node2 directories (by DB folder name)
+    node2_dirs_by_name: Dict[str, Path] = {}
+    # Optional OLD input directories (AWR-only by DB folder name)
+    old_dirs_by_name: Dict[str, Path] = {}
+    if node2_input:
+        if is_zip(node2_input):
+            print(f"→ Extracting node2 zip: {node2_input}")
+            node2_root = extract_zip(node2_input)
+        else:
+            node2_root = node2_input
+        node2_first = find_first_level_used(node2_root)
+        pairs = []
+        for p in list_database_dirs(node2_first):
+            key = _normalize_db_name(p.name)
+            node2_dirs_by_name[key] = p
+        if node2_dirs_by_name:
+            print("Node2 databases found (normalized keys): " + ", ".join(sorted(node2_dirs_by_name.keys())))
+        else:
+            print("Node2 input provided, but no DB folders found.")
+
+    if old_input:
+        if is_zip(old_input):
+            print(f"→ Extracting old base zip: {old_input}")
+            old_root = extract_zip(old_input)
+        else:
+            old_root = old_input
+        old_first = find_first_level_used(old_root)
+        for p in list_database_dirs(old_first):
+            key = _normalize_db_name(p.name)
+            old_dirs_by_name[key] = p
+        if old_dirs_by_name:
+            print("Old base databases found (normalized keys): " + ", ".join(sorted(old_dirs_by_name.keys())))
+        else:
+            print("Old input provided, but no DB folders found.")
 
     report_root.mkdir(parents=True, exist_ok=True)
     summary_lines: List[str] = []
@@ -589,6 +961,34 @@ def run_all(input_path: Path, map_csv: Optional[Path], target_version: str, repo
         # 2.2 AWR (CDB-wide)
         print("\n--- AWR ANALYSIS ---")
         awr_selected, awr_text = run_awr(db, out_dir, copy_selected_to=out_dir)
+        # Prepare old AWR text if provided
+        old_awr_text = ""
+        if old_dirs_by_name:
+            key = _normalize_db_name(cdb_name)
+            old_db = old_dirs_by_name.get(key)
+            if old_db:
+                best_old = _select_best_awr(old_db)
+                if best_old:
+                    print(f"[debug] Old AWR chosen for trend: {best_old}")
+                    old_awr_text = _render_awr_text(best_old)
+        # Append old values to Instance Efficiency lines < 70%
+        # Prefer structured dict from old AWR so we have ALL metrics, not only old warnings
+        old_ie = {}
+        if old_dirs_by_name:
+            key = _normalize_db_name(cdb_name)
+            old_db = old_dirs_by_name.get(key)
+            if old_db:
+                best_old = _select_best_awr(old_db)
+                if best_old and awr_analyzer:
+                    try:
+                        old_data = awr_analyzer.analyze(best_old)
+                        old_ie = old_data.get("Instance Efficiency Percentages (Target 100%)") or {}
+                    except Exception:
+                        old_ie = {}
+        awr_text = _append_old_ie_using_dict(awr_text, old_ie)
+        # Fallback to text matching if dict lookup missed something
+        awr_text = _append_old_instance_efficiency(awr_text, old_awr_text)
+        write_file(out_dir / "awr_analysis.txt", awr_text)
         print(awr_text, end="")
         awr_sev = severity_awr(awr_text)
 
@@ -602,6 +1002,26 @@ def run_all(input_path: Path, map_csv: Optional[Path], target_version: str, repo
         alert_csv_or_msg = run_alert_log(db, out_dir, map_csv, alert_days=alert_days)
         print(alert_csv_or_msg, end="" if alert_csv_or_msg.endswith("\n") else "\n")
         a_sev = severity_alert(alert_csv_or_msg)
+
+        # 2.4.1 NODE2 ALERT + COMBINED (if available for this DB folder)
+        if node2_dirs_by_name:
+            key = _normalize_db_name(cdb_name)
+            db2 = node2_dirs_by_name.get(key)
+            if db2:
+                print(f"\n--- NODE2 ALERT LOG (alert-only) [paired {cdb_name} ↔ {db2.name}] ---")
+                node2_text = run_alert_log_custom(db2, out_dir, map_csv, alert_days=alert_days, out_name="node2_alert_report.csv")
+                print(node2_text, end="" if node2_text.endswith("\n") else "\n")
+                # Combine
+                try:
+                    node1_csv = out_dir / "alert_report.csv"
+                    node2_csv = out_dir / "node2_alert_report.csv"
+                    combined_csv = out_dir / "combine_alert_report.csv"
+                    combine_alert_csvs(node1_csv, node2_csv, combined_csv)
+                    print(f"Combined alert CSV written: {combined_csv}")
+                except Exception as e:
+                    print(f"❌ Failed to combine alert CSVs: {e}")
+            else:
+                print("\n--- NODE2 ALERT LOG ---\n(no matching DB folder for node2)")
 
         # 2.5 BACKUP (CDB-wide)
         print("\n--- BACKUP CHECK ---")
@@ -691,6 +1111,8 @@ def main():
     ap.add_argument("--target-version", default="19.27", help="Target Oracle RU (e.g., 19.27)")
     ap.add_argument("--out", default="mini_pm_report", help="Output root folder (default: mini_pm_report)")
     ap.add_argument("--alert-days", type=int, default=92, help="Only include alert entries for the last N days (default ~3 months)")
+    ap.add_argument("--node2-input", help="Zip/folder for node2 (alert log only)", default=None)
+    ap.add_argument("--old-input", help="Zip/folder for OLD base (AWR only, for Instance Efficiency trend)", default=None)
     args = ap.parse_args()
 
     input_path = Path(args.input)
@@ -700,7 +1122,9 @@ def main():
         print(f"⚠️ Mapping CSV not found: {map_csv} (will omit cause/action)")
         map_csv = None
     report_root = Path(args.out) if Path(args.out).is_absolute() else Path.cwd() / args.out
-    run_all(input_path, map_csv, args.target_version, report_root, alert_days=args.alert_days)
+    node2_input = Path(args.node2_input) if args.node2_input else None
+    old_input = Path(args.old_input) if args.old_input else None
+    run_all(input_path, map_csv, args.target_version, report_root, alert_days=args.alert_days, node2_input=node2_input, old_input=old_input)
 
 if __name__ == "__main__":
     main()
